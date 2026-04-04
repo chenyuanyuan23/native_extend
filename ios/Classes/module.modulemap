@@ -1,0 +1,7 @@
+framework module native_extend {
+    export *
+    module Private {
+        header "ResolvWrapper.h"
+        export *
+    }
+}
