@@ -10,7 +10,11 @@ import NetworkExtension
 import CFNetwork
 import AdSupport
 import Security
-import native_extend.ResolvWrapper
+#if SWIFT_PACKAGE
+// SPM: 拆 OC target，需要显式 import
+import native_extend_internal
+#endif
+// CocoaPods: OC 头由 podspec 单 target 的 umbrella header 自动透出，Swift 直接可见
 
 
 public class NativeExtendPlugin: NSObject, FlutterPlugin, UIDocumentPickerDelegate {
