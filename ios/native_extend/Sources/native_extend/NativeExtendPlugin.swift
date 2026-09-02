@@ -29,6 +29,7 @@ public class NativeExtendPlugin: NSObject, FlutterPlugin, UIDocumentPickerDelega
     var orientationsResult: FlutterResult?
     var documentPicker: UIDocumentPickerViewController?
     var documentResult: FlutterResult?
+    private var originalBrightness: CGFloat?
     
     // 获取HomeIndicatorAwareFlutterViewController实例的方法
     private func controller() -> HomeIndicatorAwareFlutterViewController? {
@@ -55,6 +56,25 @@ public class NativeExtendPlugin: NSObject, FlutterPlugin, UIDocumentPickerDelega
         switch call.method {
         case "getPlatformVersion":
             result("iOS " + UIDevice.current.systemVersion)
+        case "setBrightness":
+            guard let arguments = call.arguments as? [String: Any],
+                  let value = arguments["brightness"] as? Int else {
+                result(argumentError)
+                return
+            }
+            if originalBrightness == nil {
+                originalBrightness = UIScreen.main.brightness
+            }
+            UIScreen.main.brightness = CGFloat(max(0, min(255, value))) / 255.0
+            result(nil)
+        case "getBrightness":
+            result(Int((UIScreen.main.brightness * 255.0).rounded()))
+        case "restoreBrightness":
+            if let brightness = originalBrightness {
+                UIScreen.main.brightness = brightness
+                originalBrightness = nil
+            }
+            result(nil)
         case "getLastShareFilePath":
             self.getLastShareFilePath(result: result)
         case "clearLastShareFilePath":

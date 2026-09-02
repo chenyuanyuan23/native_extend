@@ -1,5 +1,6 @@
 package com.example.native_extend
 
+import android.app.Activity
 import android.content.Context
 import android.os.PowerManager
 import android.content.Intent
@@ -8,6 +9,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import android.util.Log
 import androidx.annotation.NonNull
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
@@ -26,12 +28,18 @@ import java.net.InetAddress
 import java.net.NetworkInterface
 import java.net.Inet4Address
 import android.media.AudioManager
+import android.view.WindowManager
+import io.flutter.embedding.engine.plugins.activity.ActivityAware
+import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
+import kotlin.math.roundToInt
 
 /** NativeExtendPlugin */
-class NativeExtendPlugin : FlutterPlugin, MethodCallHandler {
+class NativeExtendPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
   private lateinit var channel: MethodChannel
   private lateinit var context: Context
   private lateinit var audioManager: AudioManager
+  private var activity: Activity? = null
+  private var windowBrightnessOverride: Float? = null
   private var audioFocusState = 0
 
   //注册OnAudioFocusChangeListener监听
@@ -78,6 +86,12 @@ class NativeExtendPlugin : FlutterPlugin, MethodCallHandler {
         val brightnessLevel = call.argument<Int>("brightness") ?: 128
         setBrightness(brightnessLevel, result)
       }
+      "getBrightness" -> {
+        getBrightness(result)
+      }
+      "restoreBrightness" -> {
+        restoreBrightness(result)
+      }
       "setBrightnessMode" -> {
         val mode = call.argument<Int>("mode") ?: Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL
         setBrightnessMode(mode, result)
@@ -119,6 +133,9 @@ class NativeExtendPlugin : FlutterPlugin, MethodCallHandler {
       }
       "abandonAudioFocus" -> {
         result.success(abandonAudioFocus())
+      }
+      "setRotationCrossfade" -> {
+        result.success(setRotationCrossfade(call.arguments == true))
       }
       "setMixWithOthers" -> {
         result.success(setMixWithOthers(call.arguments != null))
@@ -340,7 +357,7 @@ private fun isPrivateIpAddress(ipAddress: String): Boolean {
         false
     }
 }
-  // Method to set screen brightness
+  // Set only the current Activity window brightness, matching Tencent player behavior.
   private fun setBrightness(brightnessLevel: Int, result: Result) {
     try {
       if (brightnessLevel < 0 || brightnessLevel > 255) {
@@ -348,11 +365,85 @@ private fun isPrivateIpAddress(ipAddress: String): Boolean {
         return
       }
 
-      Settings.System.putInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS, brightnessLevel)
-      result.success("Brightness set to $brightnessLevel")
+      val currentActivity = activity
+      if (currentActivity == null || currentActivity.isDestroyed) {
+        result.error("NO_ACTIVITY", "Could not set window brightness without an active Activity", null)
+        return
+      }
+
+      windowBrightnessOverride = brightnessLevel / 255f
+      applyWindowBrightness(currentActivity, windowBrightnessOverride!!)
+      result.success("Window brightness set to $brightnessLevel")
     } catch (e: Exception) {
-      result.error("ERROR", "Could not set brightness: ${e.message}", null)
+      result.error("ERROR", "Could not set window brightness: ${e.message}", null)
     }
+  }
+
+  private fun getBrightness(result: Result) {
+    try {
+      val windowBrightness = activity?.window?.attributes?.screenBrightness ?: -1f
+      if (windowBrightness >= 0f) {
+        result.success((windowBrightness.coerceIn(0f, 1f) * 255).roundToInt())
+        return
+      }
+
+      result.success(Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS, 128))
+    } catch (e: Exception) {
+      result.error("ERROR", "Could not get window brightness: ${e.message}", null)
+    }
+  }
+
+  private fun restoreBrightness(result: Result) {
+    try {
+      windowBrightnessOverride = null
+      val currentActivity = activity
+      if (currentActivity == null || currentActivity.isDestroyed) {
+        result.error("NO_ACTIVITY", "Could not restore window brightness without an active Activity", null)
+        return
+      }
+
+      applyWindowBrightness(currentActivity, WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE)
+      result.success("Window brightness restored")
+    } catch (e: Exception) {
+      result.error("ERROR", "Could not restore window brightness: ${e.message}", null)
+    }
+  }
+
+  private fun applyWindowBrightness(targetActivity: Activity, brightness: Float) {
+    val attributes = targetActivity.window.attributes
+    attributes.screenBrightness = brightness
+    targetActivity.window.attributes = attributes
+  }
+
+  // 窗口转屏过渡声明：enable=CROSSFADE（截图冻结→交叉淡化，无旋转），
+  // disable=恢复系统默认 ROTATE。
+  // 为什么不用 SEAMLESS：华为 EMUI 对 seamless 旧帧的几何补偿实现错误——
+  // 过渡期旧画面被贴在窗口角落、其余全黑（2026-08-28 录屏逐帧实证），比
+  // 旋转动画更糟。CROSSFADE 走系统标准截图冻结管线：冻结帧几何正确且
+  // freeze 保持到 app 画完新方向首帧才淡化揭开。
+  // 必须在转向发生前至少一帧声明并保持：window.attributes 回写要等下一次
+  // ViewRootImpl relayout 才同步到 WMS，而 setRequestedOrientation 是即时
+  // binder——"转向前一刻声明"必输这场竞态，WMS 决策时读到的仍是旧值。
+  // 故由调用方在"可能转屏的会话期"（如大播放器存在期）持有。
+  private fun setRotationCrossfade(enable: Boolean): Boolean {
+    val currentActivity = activity
+    if (currentActivity == null || currentActivity.isDestroyed) return false
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
+    applyRotationAnimation(
+        currentActivity,
+        if (enable) WindowManager.LayoutParams.ROTATION_ANIMATION_CROSSFADE
+        else WindowManager.LayoutParams.ROTATION_ANIMATION_ROTATE)
+    Log.i(
+        "NativeExtend",
+        if (enable) "rotation transition = CROSSFADE"
+        else "rotation transition = ROTATE (default)")
+    return true
+  }
+
+  private fun applyRotationAnimation(targetActivity: Activity, mode: Int) {
+    val attributes = targetActivity.window.attributes
+    attributes.rotationAnimation = mode
+    targetActivity.window.attributes = attributes
   }
 
   // Method to set brightness mode (automatic/manual)
@@ -557,5 +648,22 @@ private fun isPrivateIpAddress(ipAddress: String): Boolean {
 
   override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
     channel.setMethodCallHandler(null)
+  }
+
+  override fun onAttachedToActivity(binding: ActivityPluginBinding) {
+    activity = binding.activity
+    windowBrightnessOverride?.let { applyWindowBrightness(binding.activity, it) }
+  }
+
+  override fun onDetachedFromActivityForConfigChanges() {
+    activity = null
+  }
+
+  override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
+    onAttachedToActivity(binding)
+  }
+
+  override fun onDetachedFromActivity() {
+    activity = null
   }
 }

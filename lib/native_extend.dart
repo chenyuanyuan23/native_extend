@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:events_widget/events_widget.dart';
 import 'package:sync/semaphore.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:universal_platform/universal_platform.dart';
@@ -204,6 +205,88 @@ class NativeExtend {
     curOrientation = orientation; // 会自动触发 orientationChange 事件
   }
 
+  // ========== 恢复前台方向重申（port from live3 stable_0814）==========
+  // iOS16+ 锁屏-解锁过渡会丢掉 setPreferredOrientations 的横屏声明：解锁后
+  // 窗口被系统转回竖屏（resumed 之前即可观测到竖屏 metrics），且不自行恢复。
+  // 恢复前台时若显式意图（curOrientation）与窗口真实几何不一致，重申一次意图。
+  // auto 跟随模式没有显式意图，不重申；转向在途（rotationing）自会收敛，不重申。
+  static _ResumeReassertObserver? _resumeReassertObserver;
+
+  static void _ensureResumeReassertObserver() {
+    if (_resumeReassertObserver != null) return;
+    _resumeReassertObserver = _ResumeReassertObserver();
+    WidgetsBinding.instance.addObserver(_resumeReassertObserver!);
+    debugPrint('[NativeExtend] 方向重申观察者已注册');
+  }
+
+  /// 恢复前台时应重申的方向；null 表示无需重申。纯判定，供测试直调。
+  @visibleForTesting
+  static Orientation? reassertTargetOnResume({
+    required bool isAutoRotationMode,
+    required bool rotationing,
+    required Orientation intent,
+    required Size physicalSize,
+  }) {
+    if (isAutoRotationMode) return null;
+    if (rotationing) return null;
+    if (physicalSize.width <= 0 || physicalSize.height <= 0) return null;
+    final actual = physicalSize.width > physicalSize.height
+        ? Orientation.landscape
+        : Orientation.portrait;
+    if (actual == intent) return null;
+    return intent;
+  }
+
+  static void _onResumedReassert() {
+    final view = WidgetsBinding.instance.platformDispatcher.views.first;
+    final size = view.physicalSize;
+    final target = reassertTargetOnResume(
+      isAutoRotationMode: _isAutoRotationMode,
+      rotationing: rotationing,
+      intent: _curOrientation,
+      physicalSize: size,
+    );
+    debugPrint('[NativeExtend] 恢复前台方向检查: intent=$_curOrientation '
+        'auto=$_isAutoRotationMode rotationing=$rotationing '
+        'size=${size.width.toInt()}x${size.height.toInt()} → '
+        '${target == null ? '一致,不重申' : '不一致,重申 $target'}');
+    if (target == null) return;
+    unawaited(_reassertOrientation(target));
+  }
+
+  // 强制重申:引擎端 performOrientationUpdate 对相同 mask 直接短路——锁屏丢声明后
+  // 引擎存值仍是旧 mask,重发同值到不了 UIKit。先发全集过渡 mask 改变引擎存值,
+  // 再发目标 mask 强制 requestGeometryUpdate 转回。
+  static Future<void> _reassertOrientation(Orientation target) async {
+    await _orientationSemaphore.acquire();
+    await _setRotationing(true);
+    try {
+      await SystemChrome.setPreferredOrientations([
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+        DeviceOrientation.portraitUp,
+      ]);
+      if (target == Orientation.landscape) {
+        if (Platform.isIOS) {
+          await SystemChrome.setPreferredOrientations(
+              [DeviceOrientation.landscapeRight]);
+        } else {
+          await SystemChrome.setPreferredOrientations([
+            DeviceOrientation.landscapeLeft,
+            DeviceOrientation.landscapeRight,
+          ]);
+        }
+      } else {
+        await SystemChrome.setPreferredOrientations(
+            [DeviceOrientation.portraitUp]);
+      }
+      curOrientation = target;
+    } finally {
+      _orientationSemaphore.release();
+      await _setRotationing(false);
+    }
+  }
+
   static bool _rotationing = false;
 
   static bool get rotationing =>
@@ -215,8 +298,21 @@ class NativeExtend {
     _unRotationTime = DateTime.now().millisecondsSinceEpoch + 500;
   }
 
+  /// Android：声明/撤销窗口转屏的交叉淡化过渡（CROSSFADE，API 26+）。
+  /// enable 期间的转向走系统截图冻结管线：冻结帧几何正确、保持到 app 画完
+  /// 新方向首帧才淡化揭开——无旋转动画、无变形、无黑屏。
+  /// 必须在转向发生前至少一帧声明并保持（窗口属性回写要等下一次 relayout 才同步到 WMS）。
+  /// 返回是否生效（非 Android / 无 Activity / 低于 API 26 返回 false）。port from live3 stable_0814。
+  static Future<bool> setRotationCrossfade(bool enable) async {
+    if (!Platform.isAndroid) return false;
+    final ok =
+        await methodChannel.invokeMethod<bool>('setRotationCrossfade', enable);
+    return ok ?? false;
+  }
+
   //设置竖向旋转
   static Future<void> setOrientationPortrait() async {
+    _ensureResumeReassertObserver();
     // print("@@@@@@@@@@ setOrientationPortrait");
     await _orientationSemaphore.acquire();
     await _setRotationing(true);
@@ -236,6 +332,7 @@ class NativeExtend {
 
   //设置横向旋转
   static Future<void> setOrientationLandscape() async {
+    _ensureResumeReassertObserver();
     // print("@@@@@@@@@@ setOrientationLandscape");
     await _orientationSemaphore.acquire();
     await _setRotationing(true);
@@ -260,6 +357,7 @@ class NativeExtend {
 
   //设置自动跟随手机方向
   static Future<void> setOrientationAuto({bool startListener = false}) async {
+    _ensureResumeReassertObserver();
     // print("@@@@@@@@@@ setOrientationAuto");
     await _orientationSemaphore.acquire();
     await _setRotationing(true);
@@ -443,12 +541,32 @@ class NativeExtend {
 
   // Set brightness level (0-255)
   static Future<void> setBrightness(int brightness) async {
-    if (!Platform.isAndroid) return;
     try {
       await methodChannel
           .invokeMethod('setBrightness', {"brightness": brightness});
     } on PlatformException catch (e) {
       debugPrint("Failed to set brightness: ${e.message}");
+      rethrow;
+    }
+  }
+
+  /// 读当前窗口/页面亮度（0-255），失败回退 128。port from live3 stable_0814。
+  static Future<int> getBrightness() async {
+    try {
+      return await methodChannel.invokeMethod<int>('getBrightness') ?? 128;
+    } on PlatformException catch (e) {
+      debugPrint("Failed to get brightness: ${e.message}");
+      return 128;
+    }
+  }
+
+  // Restore the page/window brightness that was active before playback.
+  static Future<void> restoreBrightness() async {
+    try {
+      await methodChannel.invokeMethod('restoreBrightness');
+    } on PlatformException catch (e) {
+      debugPrint("Failed to restore brightness: ${e.message}");
+      rethrow;
     }
   }
 
@@ -591,3 +709,13 @@ class _OrientationObserver extends WidgetsBindingObserver {
   }
 }
 
+/// 恢复前台方向重申观察者（见 NativeExtend._onResumedReassert 注释）
+class _ResumeReassertObserver extends WidgetsBindingObserver {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state == AppLifecycleState.resumed) {
+      NativeExtend._onResumedReassert();
+    }
+  }
+}

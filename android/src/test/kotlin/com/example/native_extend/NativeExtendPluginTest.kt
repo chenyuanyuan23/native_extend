@@ -24,4 +24,17 @@ internal class NativeExtendPluginTest {
 
     Mockito.verify(mockResult).success("Android " + android.os.Build.VERSION.RELEASE)
   }
+
+  // 无 Activity 时无缝旋转声明必须安全返回 false（activity 判空先于任何窗口/版本访问，
+  // 这也是该分支能在纯 JVM 下运行的前提）。守住 channel 契约：方法存在且不抛。
+  @Test
+  fun onMethodCall_setRotationCrossfade_withoutActivity_returnsFalse() {
+    val plugin = NativeExtendPlugin()
+
+    val call = MethodCall("setRotationCrossfade", true)
+    val mockResult: MethodChannel.Result = Mockito.mock(MethodChannel.Result::class.java)
+    plugin.onMethodCall(call, mockResult)
+
+    Mockito.verify(mockResult).success(false)
+  }
 }
