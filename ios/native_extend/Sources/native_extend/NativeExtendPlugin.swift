@@ -1150,9 +1150,8 @@ class HomeIndicatorAwareFlutterViewController : FlutterViewController {
             }
         }
     }
-    
-    // 控制是否允许自动旋转
-    override public var shouldAutorotate: Bool {
-        return false
-    }
+
+    // 不覆写 shouldAutorotate：沿用引擎默认 YES，转向范围由 supportedInterfaceOrientations
+    // （SystemChrome 偏好）约束。iOS≤15 强制转屏（UIDevice setValue）要根控制器允许自动旋转，
+    // 换类后返回 NO 会让横屏请求全部被拒（live3 bbtask#26968）。
 }
